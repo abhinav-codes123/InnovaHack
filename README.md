@@ -163,3 +163,5 @@ This is an evidence-strength score, not a probability that a claim is objectivel
 - External model/search requests have bounded timeouts.
 
 Before a public launch, add user authentication, organization authorization, distributed rate limiting, secret management, database backups, data-retention controls, telemetry redaction, and an abuse review appropriate to the target research domains.
+
+"Testing the merging"
