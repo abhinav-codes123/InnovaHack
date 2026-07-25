@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: verifact-api
+    env: node
+    plan: free
+    branch: main
+    root: apps/api
+    buildCommand: corepack enable && corepack prepare pnpm@latest --activate && pnpm --filter @verifact/core build && pnpm --filter @verifact/api build
+    startCommand: pnpm --filter @verifact/api start
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "4000"
+
+  - type: web
+    name: verifact-web
+    env: node
+    plan: free
+    branch: main
+    root: apps/web
+    buildCommand: corepack enable && corepack prepare pnpm@latest --activate && pnpm --filter @verifact/core build && pnpm --filter @verifact/web build
+    startCommand: pnpm --filter @verifact/web start
+    envVars:
+      - key: NEXT_PUBLIC_API_URL
+        value: "https://verifact-api.onrender.com"
