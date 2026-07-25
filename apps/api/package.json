@@ -1,0 +1,39 @@
+{
+  "name": "@verifact/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsup src/server.ts --format esm --platform node --target node22 --out-dir dist --clean",
+    "start": "node dist/server.js",
+    "db:migrate": "node scripts/migrate.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@verifact/core": "workspace:*",
+    "cors": "latest",
+    "express": "latest",
+    "helmet": "latest",
+    "pg": "latest",
+    "pino": "latest",
+    "pino-http": "latest",
+    "redis": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/cors": "latest",
+    "@types/express": "latest",
+    "@types/node": "latest",
+    "@types/pg": "latest",
+    "@types/supertest": "latest",
+    "eslint": "latest",
+    "supertest": "latest",
+    "tsx": "latest",
+    "tsup": "latest",
+    "typescript": "6.0.2",
+    "vitest": "latest"
+  }
+}
