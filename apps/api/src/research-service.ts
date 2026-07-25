@@ -18,20 +18,28 @@ export class ResearchService {
   ) {}
 
   async create(input: CreateResearchRunInput): Promise<ResearchRun> {
+    const missingProviders: string[] = [];
+    if (!this.config.TAVILY_API_KEY) {
+      missingProviders.push("TAVILY_API_KEY");
+    }
+
     const hasModelProvider =
       Boolean(this.config.GEMINI_API_KEY) ||
       Boolean(
         this.config.OPENROUTER_API_KEY && this.config.OPENROUTER_MODEL
       );
+    if (!hasModelProvider) {
+      missingProviders.push(
+        "GEMINI_API_KEY or OPENROUTER_API_KEY + OPENROUTER_MODEL"
+      );
+    }
 
-    if (
-      input.mode === "live" &&
-      (!this.config.TAVILY_API_KEY || !hasModelProvider)
-    ) {
+    if (input.mode === "live" && missingProviders.length > 0) {
       throw new AppError(
         503,
         "LIVE_PROVIDERS_NOT_CONFIGURED",
-        "Live research requires TAVILY_API_KEY and either GEMINI_API_KEY or both OPENROUTER_API_KEY and OPENROUTER_MODEL."
+        "Live research providers are not fully configured.",
+        { missingProviders }
       );
     }
 

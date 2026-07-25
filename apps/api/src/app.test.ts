@@ -8,7 +8,11 @@ const testConfig: AppConfig = {
   PORT: 4000,
   WEB_ORIGIN: "http://localhost:3000",
   DEMO_STEP_DELAY_MS: 0,
-  GEMINI_MODEL: "gemini-2.5-flash"
+  GEMINI_MODEL: "gemini-3.5-flash",
+  GEMINI_FALLBACK_MODELS: [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite"
+  ]
 };
 
 describe("research API", () => {
@@ -62,6 +66,10 @@ describe("research API", () => {
       });
     expect(response.status).toBe(503);
     expect(response.body.error.code).toBe("LIVE_PROVIDERS_NOT_CONFIGURED");
+    expect(response.body.error.details.missingProviders).toEqual([
+      "TAVILY_API_KEY",
+      "GEMINI_API_KEY or OPENROUTER_API_KEY + OPENROUTER_MODEL"
+    ]);
   });
 
   it("rejects incomplete OpenRouter configuration", async () => {
@@ -80,5 +88,8 @@ describe("research API", () => {
 
     expect(response.status).toBe(503);
     expect(response.body.error.code).toBe("LIVE_PROVIDERS_NOT_CONFIGURED");
+    expect(response.body.error.details.missingProviders).toEqual([
+      "GEMINI_API_KEY or OPENROUTER_API_KEY + OPENROUTER_MODEL"
+    ]);
   });
 });

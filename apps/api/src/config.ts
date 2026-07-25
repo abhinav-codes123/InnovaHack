@@ -12,6 +12,28 @@ const optionalSecret = z.preprocess(
   z.string().min(1).optional()
 );
 
+export const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
+export const DEFAULT_GEMINI_FALLBACK_MODELS = [
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite"
+];
+
+const geminiModel = z
+  .string()
+  .trim()
+  .min(1)
+  .default(DEFAULT_GEMINI_MODEL)
+  .transform((model) =>
+    model === "gemini-2.5-flash" ? DEFAULT_GEMINI_MODEL : model
+  );
+
+const geminiFallbackModels = z
+  .string()
+  .default(DEFAULT_GEMINI_FALLBACK_MODELS.join(","))
+  .transform((value) =>
+    [...new Set(value.split(",").map((model) => model.trim()).filter(Boolean))]
+  );
+
 const environmentSchema = z.object({
   NODE_ENV: z
     .enum(["development", "test", "production"])
@@ -21,7 +43,8 @@ const environmentSchema = z.object({
   DEMO_STEP_DELAY_MS: z.coerce.number().int().min(0).max(5_000).default(180),
   TAVILY_API_KEY: optionalSecret,
   GEMINI_API_KEY: optionalSecret,
-  GEMINI_MODEL: z.string().min(1).default("gemini-2.5-flash"),
+  GEMINI_MODEL: geminiModel,
+  GEMINI_FALLBACK_MODELS: geminiFallbackModels,
   OPENROUTER_API_KEY: optionalSecret,
   OPENROUTER_MODEL: optionalSecret,
   DATABASE_URL: optionalSecret,

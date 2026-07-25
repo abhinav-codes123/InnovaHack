@@ -25,7 +25,7 @@ export function assessSourceQuality(input: SourceQualityInput): {
 
   if (input.isPrimary) {
     score += 22;
-    reasons.push("Primary evidence or first-party dataset.");
+    reasons.push("Primary evidence or authoritative first-party source.");
   }
   if (input.hasNamedAuthor) {
     score += 10;

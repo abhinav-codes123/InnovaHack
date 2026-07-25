@@ -40,6 +40,14 @@ const planSchema = z.object({
     .max(6)
 });
 
+const providerScoreSchema = z
+  .number()
+  .min(0)
+  .max(100)
+  .describe(
+    "A score from 0 to 100, where 100 is strongest. Do not use a 0 to 1 scale."
+  );
+
 const extractedClaimSchema = z.object({
   text: z.string().min(10),
   subject: z.string().min(1),
@@ -50,8 +58,8 @@ const extractedClaimSchema = z.object({
   locationContext: z.string().optional(),
   qualifiers: z.array(z.string()).max(8),
   importance: z.enum(["high", "medium", "low"]),
-  completeness: z.number().min(0).max(100),
-  timeRelevance: z.number().min(0).max(100),
+  completeness: providerScoreSchema,
+  timeRelevance: providerScoreSchema,
   contextDependent: z.boolean().default(false),
   evidence: z
     .array(
@@ -59,15 +67,15 @@ const extractedClaimSchema = z.object({
         sourceId: z.string(),
         excerpt: z.string().min(10).max(1_500),
         relation: z.enum(["supports", "contradicts", "neutral"]),
-        directness: z.number().min(0).max(100),
-        contextualMatch: z.number().min(0).max(100),
+        directness: providerScoreSchema,
+        contextualMatch: providerScoreSchema,
         rationale: z.string().min(5).max(500)
       })
     )
     .max(12)
 });
 
-const extractionSchema = z.object({
+export const extractionSchema = z.object({
   claims: z.array(extractedClaimSchema).min(1).max(12)
 });
 
@@ -92,6 +100,56 @@ interface SourceDocument {
   content: string;
 }
 
+const transientProviderStatuses = new Set([429, 500, 502, 503, 504]);
+let preferredGeminiModel: string | undefined;
+
+const wait = async (durationMs: number): Promise<void> => {
+  await new Promise((resolve) => setTimeout(resolve, durationMs));
+};
+
+function retryDelayMs(response: Response, attempt: number): number {
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) {
+      return Math.min(Math.max(seconds * 1_000, 250), 15_000);
+    }
+    const retryAt = Date.parse(retryAfter);
+    if (Number.isFinite(retryAt)) {
+      return Math.min(Math.max(retryAt - Date.now(), 250), 15_000);
+    }
+  }
+  return Math.min(1_000 * 2 ** attempt, 8_000);
+}
+
+export async function fetchWithRetry(
+  url: string,
+  createInit: () => RequestInit,
+  maxAttempts = 4
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const response = await fetch(url, createInit());
+      if (
+        response.ok ||
+        !transientProviderStatuses.has(response.status) ||
+        attempt === maxAttempts - 1
+      ) {
+        return response;
+      }
+      await wait(retryDelayMs(response, attempt));
+    } catch (error) {
+      lastError = error;
+      if (attempt === maxAttempts - 1) throw error;
+      await wait(Math.min(1_000 * 2 ** attempt, 8_000));
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Provider request failed after retries.");
+}
+
 export interface LivePlan {
   normalizedQuestion: string;
   scope: ResearchScope;
@@ -106,6 +164,17 @@ export interface LiveVerification {
   report: ReportSummary;
 }
 
+export function usesFractionalScoreScale(values: number[]): boolean {
+  return values.length > 0 && values.every((value) => value >= 0 && value <= 1);
+}
+
+export function normalizeProviderScore(
+  value: number,
+  usesFractionalScale: boolean
+): number {
+  return usesFractionalScale ? value * 100 : value;
+}
+
 function extractJson(text: string): unknown {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const candidate = fenced?.[1] ?? text;
@@ -117,6 +186,91 @@ function extractJson(text: string): unknown {
   return JSON.parse(candidate.slice(start, end + 1));
 }
 
+const supportedJsonSchemaKeys = new Set([
+  "$id",
+  "$defs",
+  "$ref",
+  "$anchor",
+  "type",
+  "format",
+  "title",
+  "description",
+  "enum",
+  "items",
+  "prefixItems",
+  "anyOf",
+  "oneOf",
+  "properties",
+  "required",
+  "propertyOrdering"
+]);
+
+export function toGeminiJsonSchema(schema: z.ZodType): unknown {
+  const sanitize = (value: unknown, preserveKeys = false): unknown => {
+    if (Array.isArray(value)) return value.map((item) => sanitize(item));
+    if (!value || typeof value !== "object") return value;
+
+    return Object.fromEntries(
+      Object.entries(value).flatMap(([key, child]) => {
+        if (!preserveKeys && !supportedJsonSchemaKeys.has(key)) return [];
+        return [
+          [
+            key,
+            sanitize(
+              child,
+              key === "properties" || key === "$defs"
+            )
+          ]
+        ];
+      })
+    );
+  };
+
+  return sanitize(z.toJSONSchema(schema));
+}
+
+async function providerFailure(
+  provider: string,
+  response: Response,
+  secrets: string[] = []
+): Promise<Error> {
+  let detail: string;
+  try {
+    const payload = (await response.clone().json()) as {
+      error?: {
+        message?: string;
+        status?: string;
+        details?: unknown[];
+      };
+      message?: string;
+    };
+    detail = payload.error?.message ?? payload.message ?? "";
+    if (payload.error?.status) {
+      detail += ` Status: ${payload.error.status}.`;
+    }
+    if (payload.error?.details?.length) {
+      detail += ` Details: ${JSON.stringify(payload.error.details)}`;
+    }
+  } catch {
+    detail = await response.text();
+  }
+
+  let sanitized = detail.replace(/\s+/g, " ").trim().slice(0, 500);
+  for (const secret of secrets) {
+    if (secret) sanitized = sanitized.replaceAll(secret, "[redacted]");
+  }
+  sanitized = sanitized
+    .replace(/AIza[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/sk-or-[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/tvly-[A-Za-z0-9_-]+/g, "[redacted]");
+
+  return new Error(
+    `${provider} request failed with status ${response.status}${
+      sanitized ? `: ${sanitized}` : ""
+    }.`
+  );
+}
+
 class ModelProvider {
   constructor(private readonly config: AppConfig) {}
 
@@ -125,46 +279,102 @@ class ModelProvider {
     system: string,
     user: string
   ): Promise<T> {
-    const text = this.config.GEMINI_API_KEY
-      ? await this.generateWithGemini(system, user)
-      : await this.generateWithOpenRouter(system, user);
-    return schema.parse(extractJson(text));
+    let repairInstruction = "";
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const currentUser = repairInstruction
+        ? `${user}\n\n${repairInstruction}`
+        : user;
+      const text = this.config.GEMINI_API_KEY
+        ? await this.generateWithGemini(
+            system,
+            currentUser,
+            toGeminiJsonSchema(schema)
+          )
+        : await this.generateWithOpenRouter(system, currentUser);
+      try {
+        return schema.parse(extractJson(text));
+      } catch (error) {
+        lastError = error;
+        if (attempt === 1) throw error;
+        const validationMessage =
+          error instanceof z.ZodError
+            ? JSON.stringify(
+                error.issues.map((issue) => ({
+                  path: issue.path.join("."),
+                  message: issue.message
+                }))
+              )
+            : error instanceof Error
+              ? error.message
+              : "The response was not valid JSON.";
+        repairInstruction = [
+          "Regenerate the entire JSON response.",
+          "The previous response failed local validation:",
+          validationMessage.slice(0, 1_500),
+          "Follow every requested count, length, and field constraint."
+        ].join("\n");
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("The model did not return valid structured output.");
   }
 
   private async generateWithGemini(
     system: string,
-    user: string
+    user: string,
+    responseJsonSchema: unknown
   ): Promise<string> {
     const key = this.config.GEMINI_API_KEY;
     if (!key) throw new Error("GEMINI_API_KEY is not configured.");
-    const model = encodeURIComponent(this.config.GEMINI_MODEL);
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: system }] },
-          contents: [{ role: "user", parts: [{ text: user }] }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            temperature: 0.1
-          }
-        }),
-        signal: AbortSignal.timeout(45_000)
+    const models = [
+      ...new Set([
+        ...(preferredGeminiModel ? [preferredGeminiModel] : []),
+        this.config.GEMINI_MODEL,
+        ...this.config.GEMINI_FALLBACK_MODELS
+      ])
+    ];
+
+    for (const [modelIndex, modelName] of models.entries()) {
+      const model = encodeURIComponent(modelName);
+      const response = await fetchWithRetry(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        () => ({
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key
+          },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: system }] },
+            contents: [{ role: "user", parts: [{ text: user }] }],
+            generationConfig: {
+              responseMimeType: "application/json",
+              responseJsonSchema
+            }
+          }),
+          signal: AbortSignal.timeout(45_000)
+        })
+      );
+      const hasFallback = modelIndex < models.length - 1;
+      if (!response.ok) {
+        if (hasFallback && [404, 429, 503].includes(response.status)) continue;
+        throw await providerFailure(`Gemini (${modelName})`, response, [key]);
       }
-    );
-    if (!response.ok) {
-      throw new Error(`Gemini request failed with status ${response.status}.`);
+      const body = (await response.json()) as {
+        candidates?: Array<{
+          content?: { parts?: Array<{ text?: string }> };
+        }>;
+      };
+      const text = body.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (text) {
+        preferredGeminiModel = modelName;
+        return text;
+      }
+      if (!hasFallback) throw new Error(`Gemini (${modelName}) returned no content.`);
     }
-    const body = (await response.json()) as {
-      candidates?: Array<{
-        content?: { parts?: Array<{ text?: string }> };
-      }>;
-    };
-    const text = body.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error("Gemini returned no content.");
-    return text;
+    throw new Error("All configured Gemini models failed.");
   }
 
   private async generateWithOpenRouter(
@@ -178,28 +388,29 @@ class ModelProvider {
         "OPENROUTER_API_KEY and OPENROUTER_MODEL must both be configured."
       );
     }
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-        "X-Title": "VeriFact AI"
-      },
-      body: JSON.stringify({
-        model,
-        temperature: 0.1,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user }
-        ]
-      }),
-      signal: AbortSignal.timeout(45_000)
-    });
+    const response = await fetchWithRetry(
+      "https://openrouter.ai/api/v1/chat/completions",
+      () => ({
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+          "X-Title": "VeriFact AI"
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.1,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user }
+          ]
+        }),
+        signal: AbortSignal.timeout(45_000)
+      })
+    );
     if (!response.ok) {
-      throw new Error(
-        `OpenRouter request failed with status ${response.status}.`
-      );
+      throw await providerFailure("OpenRouter", response, [key]);
     }
     const body = (await response.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
@@ -214,7 +425,7 @@ class TavilyProvider {
   constructor(private readonly apiKey: string) {}
 
   async search(query: string): Promise<SearchResult[]> {
-    const response = await fetch("https://api.tavily.com/search", {
+    const response = await fetchWithRetry("https://api.tavily.com/search", () => ({
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -226,9 +437,9 @@ class TavilyProvider {
         include_answer: false
       }),
       signal: AbortSignal.timeout(30_000)
-    });
+    }));
     if (!response.ok) {
-      throw new Error(`Tavily request failed with status ${response.status}.`);
+      throw await providerFailure("Tavily", response, [this.apiKey]);
     }
     const body = (await response.json()) as {
       results?: Array<{
@@ -259,25 +470,88 @@ class TavilyProvider {
   }
 }
 
-function inferSourceKind(url: string): SourceKind {
+function hostnameMatches(hostname: string, domain: string): boolean {
+  return hostname === domain || hostname.endsWith(`.${domain}`);
+}
+
+const academicDomains = [
+  "arxiv.org",
+  "bmj.com",
+  "cochrane.org",
+  "doi.org",
+  "frontiersin.org",
+  "jamanetwork.com",
+  "nature.com",
+  "nejm.org",
+  "ncbi.nlm.nih.gov",
+  "plos.org",
+  "sciencedirect.com",
+  "springer.com",
+  "thelancet.com"
+];
+
+const officialDomains = [
+  "iea.org",
+  "oecd.org",
+  "un.org",
+  "who.int",
+  "worldbank.org"
+];
+
+export function inferSourceKind(url: string): SourceKind {
   const hostname = new URL(url).hostname.toLowerCase();
-  if (hostname.endsWith(".gov") || hostname.includes(".gov.")) return "government";
+  if (academicDomains.some((domain) => hostnameMatches(hostname, domain))) {
+    return "academic";
+  }
+  if (
+    hostname.endsWith(".gov") ||
+    hostname.includes(".gov.") ||
+    hostnameMatches(hostname, "europa.eu")
+  )
+    return "government";
   if (
     hostname.endsWith(".edu") ||
-    hostname.includes("arxiv.org") ||
-    hostname.includes("nature.com") ||
-    hostname.includes("sciencedirect.com") ||
-    hostname.includes("springer.com")
+    academicDomains.some((domain) => hostnameMatches(hostname, domain))
   )
     return "academic";
   if (
-    hostname.includes("reuters.com") ||
-    hostname.includes("apnews.com") ||
-    hostname.includes("bbc.")
+    hostnameMatches(hostname, "reuters.com") ||
+    hostnameMatches(hostname, "apnews.com") ||
+    hostnameMatches(hostname, "bbc.com") ||
+    hostnameMatches(hostname, "bbc.co.uk")
   )
     return "news";
-  if (hostname.endsWith(".org")) return "official";
+  if (officialDomains.some((domain) => hostnameMatches(hostname, domain))) {
+    return "official";
+  }
   return "general";
+}
+
+export function hasMethodologySignal(content: string): boolean {
+  const sample = content.slice(0, 20_000);
+  return (
+    /(?:^|\n)\s{0,3}(?:#{1,4}\s*)?(?:materials and )?methods?(?:ology)?\s*(?:\n|:)/im.test(
+      sample
+    ) ||
+    /\b(?:randomi[sz]ed controlled trial|systematic review|meta-analysis|study design|participants were|we (?:analysed|analyzed|examined|estimated))\b/i.test(
+      sample
+    )
+  );
+}
+
+export function canonicalSourceTitle(title: string): string {
+  return normalizeEvidence(title)
+    .replace(/\b(?:full text|pmc|pubmed|review)\b/g, " ")
+    .replace(/\s*[-|:]\s*(?:cochrane|springer|wiley|elsevier)\s*$/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function requiresProfessionalAdviceBoundary(question: string): boolean {
+  return /\b(?:diagnos(?:e|is)|disease|drug|health|legal|law|lawsuit|medical|medicine|medication|supplement|tax|treatment)\b/i.test(
+    question
+  );
 }
 
 function sourceId(url: string): string {
@@ -343,7 +617,8 @@ export class LiveResearchProvider {
       planSchema,
       [
         "You are the research planner for an evidence-verification system.",
-        "Return JSON only. Decompose the question into independent, bounded research tasks.",
+        "Return JSON only. Create between 2 and 6 independent, bounded research tasks.",
+        "Each task must include between 1 and 3 focused search queries.",
         "State assumptions explicitly. Do not answer the question."
       ].join(" "),
       `Create a research plan for this question:\n${query}`
@@ -383,16 +658,17 @@ export class LiveResearchProvider {
     return [...unique.values()].map((result) => {
       const kind = inferSourceKind(result.url);
       const hostname = new URL(result.url).hostname;
+      const hasMethodology = hasMethodologySignal(result.content);
       const quality = assessSourceQuality({
         kind,
-        isPrimary: kind === "government" || kind === "academic",
+        isPrimary: kind === "government" || kind === "official",
         hasNamedAuthor: false,
-        hasMethodology: kind === "academic",
+        hasMethodology,
         hasPublicationDate: Boolean(result.publishedAt),
         topicRelevance: result.score
       });
       const contentGroup = createHash("sha256")
-        .update(normalizeEvidence(result.content).slice(0, 1_000))
+        .update(canonicalSourceTitle(result.title))
         .digest("hex")
         .slice(0, 12);
       return {
@@ -420,11 +696,16 @@ export class LiveResearchProvider {
     if (documents.length === 0) {
       throw new Error("No retrievable source documents were collected.");
     }
-    const sourcePacket = documents
-      .slice(0, 20)
+    const selectedDocuments = [...documents]
+      .sort(
+        (left, right) =>
+          right.source.qualityScore - left.source.qualityScore
+      )
+      .slice(0, 12);
+    const sourcePacket = selectedDocuments
       .map(
         ({ source, content }) =>
-          `SOURCE_ID: ${source.id}\nTITLE: ${source.title}\nURL: ${source.url}\nCONTENT:\n${content.slice(0, 12_000)}`
+          `SOURCE_ID: ${source.id}\nTITLE: ${source.title}\nURL: ${source.url}\nSOURCE_KIND: ${source.kind}\nQUALITY_SCORE: ${source.qualityScore}\nINDEPENDENCE_GROUP: ${source.independenceGroup}\nCONTENT:\n${content.slice(0, 6_000)}`
       )
       .join("\n\n---\n\n");
     const extraction = await this.model.generate(
@@ -433,13 +714,26 @@ export class LiveResearchProvider {
         "You extract atomic factual claims and map them to evidence.",
         "Use only the supplied sources. Evidence excerpts must be exact contiguous quotations from CONTENT.",
         "Never invent a source ID or quotation. Separate lack of evidence from contradiction.",
+        "For each material claim, include exact evidence from 2 to 4 independent sources when available, preferring government, official, and peer-reviewed academic sources with higher quality scores.",
+        "Sources with the same INDEPENDENCE_GROUP are duplicate publications and must count as one source; prefer the highest-quality copy.",
+        "Do not treat the absence of evidence as proof that something did not happen.",
+        "When no direct evidence exists, phrase the claim as 'No verifiable evidence was found that ...' and leave its evidence array empty.",
         "Return JSON only."
       ].join(" "),
       `QUESTION:\n${question}\n\nSOURCES:\n${sourcePacket}`
     );
+    const providerScores = extraction.claims.flatMap((candidate) => [
+      candidate.completeness,
+      candidate.timeRelevance,
+      ...candidate.evidence.flatMap((item) => [
+        item.directness,
+        item.contextualMatch
+      ])
+    ]);
+    const usesFractionalScale = usesFractionalScoreScale(providerScores);
 
     const documentBySourceId = new Map(
-      documents.map((document) => [document.source.id, document])
+      selectedDocuments.map((document) => [document.source.id, document])
     );
     const evidence: EvidenceLink[] = [];
     const claims: Claim[] = extraction.claims.map((candidate, claimIndex) => {
@@ -459,8 +753,14 @@ export class LiveResearchProvider {
           sourceId: item.sourceId,
           excerpt: item.excerpt,
           relation: item.relation,
-          directness: item.directness,
-          contextualMatch: item.contextualMatch,
+          directness: normalizeProviderScore(
+            item.directness,
+            usesFractionalScale
+          ),
+          contextualMatch: normalizeProviderScore(
+            item.contextualMatch,
+            usesFractionalScale
+          ),
           rationale: item.rationale
         };
         evidence.push(link);
@@ -468,9 +768,15 @@ export class LiveResearchProvider {
       });
       const result = scoreClaim({
         evidence: validEvidence,
-        sources: documents.map((document) => document.source),
-        completeness: candidate.completeness,
-        timeRelevance: candidate.timeRelevance,
+        sources: selectedDocuments.map((document) => document.source),
+        completeness: normalizeProviderScore(
+          candidate.completeness,
+          usesFractionalScale
+        ),
+        timeRelevance: normalizeProviderScore(
+          candidate.timeRelevance,
+          usesFractionalScale
+        ),
         contextDependent: candidate.contextDependent
       });
       return {
@@ -500,25 +806,42 @@ export class LiveResearchProvider {
       text: claim.text,
       status: claim.status,
       confidence: claim.confidence,
-      evidenceCount: evidence.filter((item) => item.claimId === claim.id).length
+      evidence: evidence
+        .filter((item) => item.claimId === claim.id)
+        .map((item) => {
+          const source = documentBySourceId.get(item.sourceId)?.source;
+          return {
+            relation: item.relation,
+            sourceTitle: source?.title,
+            sourceKind: source?.kind,
+            sourceQuality: source?.qualityScore
+          };
+        })
     }));
     const report = await this.model.generate(
       reportSchema,
       [
         "You synthesize a research report using only the supplied verified claims.",
+        "Answer the user's question directly in the headline, executive summary, and conclusion.",
         "Do not introduce new factual claims. Express uncertainty explicitly.",
+        "Limitations must be specific to missing evidence, source quality, scope, or context; never use vague boilerplate.",
+        "Recommendations must be concrete and useful. Return an empty recommendations array when no action or further investigation is warranted.",
+        "Do not give prescriptive medical, legal, or financial advice.",
         "Return JSON only."
       ].join(" "),
       `QUESTION:\n${question}\n\nVERIFIED CLAIMS:\n${JSON.stringify(reportInput, null, 2)}`
     );
 
     return {
-      sources: documents.map((document) => document.source),
+      sources: selectedDocuments.map((document) => document.source),
       claims,
       evidence,
       contradictions,
       report: {
         ...report,
+        recommendations: requiresProfessionalAdviceBoundary(question)
+          ? []
+          : report.recommendations,
         overallConfidence: calculateOverallConfidence(claims)
       }
     };

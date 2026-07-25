@@ -22,12 +22,14 @@ describe("scoreClaim", () => {
     const result = scoreClaim({
       evidence: [],
       sources: demoSources,
-      completeness: 0,
-      timeRelevance: 0
+      completeness: 100,
+      timeRelevance: 100
     });
 
     expect(result.confidence).toBe(0);
     expect(result.status).toBe("insufficient_evidence");
+    expect(result.breakdown.completeness).toBe(0);
+    expect(result.breakdown.timeRelevance).toBe(0);
   });
 
   it("applies a contradiction penalty", () => {

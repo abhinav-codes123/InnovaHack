@@ -61,8 +61,13 @@ export function scoreClaim(input: ScoreClaimInput): {
     0,
     20
   );
-  const completeness = clamp((input.completeness / 100) * 15, 0, 15);
-  const timeRelevance = clamp((input.timeRelevance / 100) * 10, 0, 10);
+  const hasMaterialEvidence = supporting.length + contradicting.length > 0;
+  const completeness = hasMaterialEvidence
+    ? clamp((input.completeness / 100) * 15, 0, 15)
+    : 0;
+  const timeRelevance = hasMaterialEvidence
+    ? clamp((input.timeRelevance / 100) * 10, 0, 10)
+    : 0;
 
   const contradictionStrength = contradicting.reduce((total, item) => {
     const source = sourceById.get(item.sourceId);
