@@ -14,7 +14,7 @@ const suggestions = [
 export function ResearchLaunch() {
   const router = useRouter();
   const [query, setQuery] = useState(suggestions[0] ?? "");
-  const [mode, setMode] = useState<"demo" | "live">("demo");
+  const [mode, setMode] = useState<"demo" | "live">("live");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
 

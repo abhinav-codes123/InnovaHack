@@ -21,7 +21,7 @@ import { ResearchService } from "./research-service.js";
 
 const createRunSchema = z.object({
   query: z.string().trim().min(10).max(1_000),
-  mode: z.enum(["demo", "live"]).default("demo")
+  mode: z.enum(["demo", "live"]).default("live")
 });
 
 export function createApp(config: AppConfig) {
